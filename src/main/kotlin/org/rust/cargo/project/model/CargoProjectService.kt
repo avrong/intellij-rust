@@ -19,6 +19,7 @@ import com.intellij.util.messages.Topic
 import org.rust.cargo.CargoConstants
 import org.rust.cargo.project.settings.rustSettings
 import org.rust.cargo.project.workspace.CargoWorkspace
+import org.rust.cargo.project.workspace.PackageRoot
 import org.rust.cargo.toolchain.RustToolchain
 import org.rust.cargo.toolchain.RustcVersion
 import org.rust.ide.notifications.showBalloon
@@ -86,6 +87,8 @@ interface CargoProject : UserDataHolderEx {
     val workspace: CargoWorkspace?
 
     val rustcInfo: RustcInfo?
+
+    val userOverriddenFeatures: Map<PackageRoot, Set<String>>
 
     val workspaceStatus: UpdateStatus
     val stdlibStatus: UpdateStatus

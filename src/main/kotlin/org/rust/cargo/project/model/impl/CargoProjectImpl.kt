@@ -5,6 +5,7 @@
 
 package org.rust.cargo.project.model.impl
 
+import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
 import com.intellij.execution.ExecutionException
 import com.intellij.execution.process.ProcessAdapter
 import com.intellij.execution.process.ProcessEvent
@@ -51,9 +52,7 @@ import org.rust.cargo.project.settings.RustProjectSettingsService.RustSettingsLi
 import org.rust.cargo.project.settings.rustSettings
 import org.rust.cargo.project.settings.toolchain
 import org.rust.cargo.project.toolwindow.CargoToolWindow.Companion.initializeToolWindowIfNeeded
-import org.rust.cargo.project.workspace.CargoWorkspace
-import org.rust.cargo.project.workspace.PackageOrigin
-import org.rust.cargo.project.workspace.StandardLibrary
+import org.rust.cargo.project.workspace.*
 import org.rust.cargo.runconfig.command.workingDirectory
 import org.rust.cargo.toolchain.RustToolchain
 import org.rust.cargo.toolchain.Rustup
@@ -63,6 +62,7 @@ import org.rust.ide.notifications.showBalloon
 import org.rust.openapiext.*
 import org.rust.stdext.AsyncValue
 import org.rust.stdext.applyWithSymlink
+import org.rust.stdext.buildMap
 import org.rust.stdext.joinAll
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -119,6 +119,7 @@ open class CargoProjectsServiceImpl(
 
 
     private val noProjectMarker = CargoProjectImpl(Paths.get(""), this)
+
     /**
      * [directoryIndex] allows to quickly map from a [VirtualFile] to
      * a containing [CargoProject].
@@ -212,6 +213,81 @@ open class CargoProjectsServiceImpl(
             .flatMap { ModuleRootManager.getInstance(it).contentRoots.asSequence() }
             .mapNotNull { it.findChild(RustToolchain.CARGO_TOML) }
 
+    fun updateFeature(
+        cargoProject: CargoProjectImpl,
+        pkg: CargoWorkspace.Package,
+        name: String,
+        enable: Boolean,
+        isDocUnsaved: Boolean
+    ) {
+        if (isDocUnsaved) {
+            runWriteAction { saveAllDocuments() }
+            refreshAllProjects()
+        }
+
+        val userOverriddenFeatures = cargoProject.userOverriddenFeatures
+            .mapValues { (_, v) -> v.toMutableSet() }
+            .toMutableMap()
+        val packageRoot = pkg.rootDirectory.toString()
+        val packageFeatures = userOverriddenFeatures.getOrPut(packageRoot) { hashSetOf() }
+
+        projects.updateSync { projects ->
+            val oldProject = projects.singleOrNull { it.manifest == cargoProject.manifest }
+                ?: return@updateSync projects
+            val workspace = oldProject.workspace ?: return@updateSync projects
+
+            if (enable) {
+                /** When the user enables a feature, all we have to do is add it into [userOverriddenFeatures] */
+                packageFeatures.add(name)
+            } else {
+                /**
+                 * But when disables, we should disable all the features that were enabled automatically due to this one
+                 *
+                 * For example, consider such a case:
+                 * (let [a] mean the feature was enabled automatically, [u] – by the user)
+                 * - [u] foo = []
+                 * - [a] bar = []
+                 * - [u] foobar ["foo", "bar"]
+                 * - [u] baz = ["foo", "bar", "foobar"]
+                 *
+                 * When the user disables the feature `foobar`, the feature `baz` will be disabled transitively.
+                 * But we also should disable `bar` because the user did not enable it. So we finished with this:
+                 * - [u] foo = []
+                 * - [ ] bar = []
+                 * - [ ] foobar ["foo", "bar"]
+                 * - [ ] baz = ["foo", "bar", "foobar"]
+                 */
+                packageFeatures.remove(name)
+                val featuresState = workspace.features.apply {
+                    for (feature in packageFeatures) {
+                        enable(pkg.findFeature(feature))
+                    }
+                    disable(pkg.findFeature(name))
+                }
+                for ((feature, state) in featuresState) {
+                    if (state == FeatureState.Disabled) {
+                        val featurePackageRoot = feature.pkg.rootDirectory.toString()
+                        userOverriddenFeatures[featurePackageRoot]?.remove(feature.name)
+                    }
+                }
+            }
+            val newProject = oldProject.copy(userOverriddenFeatures = userOverriddenFeatures)
+            projects.filter { it.manifest != cargoProject.manifest } + newProject
+        }.whenComplete { projects, _ ->
+            invokeAndWaitIfNeeded {
+                runWriteAction {
+                    directoryIndex.resetIndex()
+                    project.messageBus.syncPublisher(CargoProjectsService.CARGO_PROJECTS_TOPIC)
+                        .cargoProjectsUpdated(projects)
+                    //TODO: Do something lightweight instead of heavy `refreshAllProjects`
+                    // Probably, full refresh is only necessary in case of a new dependency
+                    refreshAllProjects()
+                    DaemonCodeAnalyzer.getInstance(project).restart()
+                }
+            }
+        }
+    }
+
     /**
      * All modifications to project model except for low-level `loadState` should
      * go through this method: it makes sure that when we update various IDEA listeners,
@@ -247,19 +323,42 @@ open class CargoProjectsServiceImpl(
         for (cargoProject in allProjects) {
             val cargoProjectElement = Element("cargoProject")
             cargoProjectElement.setAttribute("FILE", cargoProject.manifest.systemIndependentPath)
+            val userOverriddenFeatures = buildString {
+                for ((pkg, features) in cargoProject.userOverriddenFeatures) {
+                    val pkgFeatures = features.joinToString(", ", prefix = "$pkg: ", postfix = "\n")
+                    append(pkgFeatures)
+                }
+            }
+            cargoProjectElement.setAttribute("USER_FEATURES", userOverriddenFeatures)
             state.addContent(cargoProjectElement)
         }
         return state
     }
 
     override fun loadState(state: Element) {
-        val loaded = state.getChildren("cargoProject")
-            .mapNotNull { it.getAttributeValue("FILE") }
-            .map { CargoProjectImpl(Paths.get(it), this) }
+        val cargoProjects = state.getChildren("cargoProject")
+        val loaded = mutableListOf<CargoProjectImpl>()
+
+        for (cargoProject in cargoProjects) {
+            val file = cargoProject.getAttributeValue("FILE")
+            val featuresAttr = cargoProject.getAttributeValue("USER_FEATURES").orEmpty()
+            val userOverriddenFeatures = buildMap<String, Set<String>> {
+                for (line in featuresAttr.lines()) {
+                    if (": " in line) {
+                        val pkg = line.substringBeforeLast(": ")
+                        val features = line.substringAfterLast(": ").split(", ").toSet()
+                        put(pkg, features)
+                    }
+                }
+            }
+            val newProject = CargoProjectImpl(Paths.get(file), this, userOverriddenFeatures)
+            loaded.add(newProject)
+        }
+
         // Refresh projects via `invokeLater` to avoid model modifications
         // while the project is being opened. Use `updateSync` directly
         // instead of `modifyProjects` for this reason
-        projects.updateSync { _ -> loaded }
+        projects.updateSync { loaded }
             .whenComplete { _, _ ->
                 invokeLater { refreshAllProjects() }
             }
@@ -280,6 +379,7 @@ open class CargoProjectsServiceImpl(
 data class CargoProjectImpl(
     override val manifest: Path,
     private val projectService: CargoProjectsServiceImpl,
+    override val userOverriddenFeatures: Map<PackageRoot, Set<String>> = hashMapOf(), // Package -> Features
     private val rawWorkspace: CargoWorkspace? = null,
     private val stdlib: StandardLibrary? = null,
     override val rustcInfo: RustcInfo? = null,
@@ -293,6 +393,7 @@ data class CargoProjectImpl(
         val rawWorkspace = rawWorkspace ?: return@lazy null
         val stdlib = stdlib ?: return@lazy rawWorkspace
         rawWorkspace.withStdlib(stdlib, rawWorkspace.cfgOptions, rustcInfo)
+            .withOverriddenFeatures(userOverriddenFeatures)
     }
 
     override val presentableName: String
@@ -315,8 +416,8 @@ data class CargoProjectImpl(
 
     fun refresh(): CompletableFuture<CargoProjectImpl> {
         if (!workingDirectory.exists()) {
-            return CompletableFuture.completedFuture(copy(
-                stdlibStatus = UpdateStatus.UpdateFailed("Project directory does not exist"))
+            return CompletableFuture.completedFuture(
+                copy(stdlibStatus = UpdateStatus.UpdateFailed("Project directory does not exist"))
             )
         }
         return refreshRustcInfo()
