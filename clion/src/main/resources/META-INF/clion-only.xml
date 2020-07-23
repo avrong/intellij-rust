@@ -6,6 +6,8 @@
     </extensions>
 
     <extensions defaultExtensionNs="com.intellij">
+        <directoryProjectGenerator implementation="org.rust.clion.RsCLionProjectGenerator"/>
+
         <programRunner implementation="org.rust.clion.debugger.runconfig.RsCLionDebugRunner"/>
         <programRunner implementation="org.rust.clion.debugger.runconfig.legacy.RsCLionDebugRunnerLegacy"/>
 
